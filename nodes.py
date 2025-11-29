@@ -1,15 +1,16 @@
 """
 Z-Image Utility
 
-Uses FREE Qwen API via OpenRouter (or any other OpenRouter model).
+Supports both OpenRouter API and Local LLM servers.
 
 Features:
+- Multiple Provider Support (OpenRouter / Local LLM)
 - User-definable Model ID
 - Manual Retry Count Control
 - Strict Error Handling
 - Smart Rate Limit Handling (Respects Retry-After headers)
 - Detailed Debug Logging Output
-- 100% FREE via OpenRouter
+- Local LLM Support (Ollama, LM Studio, vLLM, text-generation-webui, etc.)
 """
 
 import os
@@ -275,55 +276,225 @@ class OpenRouterClient:
 
 
 # ============================================================================
+# LOCAL LLM CLIENT
+# ============================================================================
+
+class LocalLLMClient:
+    """Client for local LLM servers with OpenAI-compatible API."""
+
+    def __init__(self, endpoint: str):
+        """
+        Initialize local LLM client.
+
+        Args:
+            endpoint: The base URL of your local LLM server
+                     Examples:
+                     - Ollama: http://localhost:11434/v1/chat/completions
+                     - LM Studio: http://localhost:1234/v1/chat/completions
+                     - vLLM: http://localhost:8000/v1/chat/completions
+                     - text-generation-webui: http://localhost:5000/v1/chat/completions
+        """
+        self.endpoint = endpoint.rstrip('/')
+
+        # Auto-append chat completions path if not present
+        if not self.endpoint.endswith('/chat/completions'):
+            if self.endpoint.endswith('/v1'):
+                self.endpoint = f"{self.endpoint}/chat/completions"
+            elif not '/v1/' in self.endpoint:
+                self.endpoint = f"{self.endpoint}/v1/chat/completions"
+
+    def chat(self, messages: List[Dict], model: str, temperature: float = 0.7, max_tokens: int = 2048, retry_count: int = 3, debug_log: Optional[List[str]] = None) -> str:
+        """Send chat completion request to local LLM server with retries."""
+
+        # Helper to log to both logger and debug_log list
+        def log(msg):
+            logger.debug(msg)
+            if debug_log is not None:
+                debug_log.append(msg)
+
+        log(f"\n[LOCAL LLM REQUEST]")
+        log(f"Endpoint: {self.endpoint}")
+        log(f"Model: {model}")
+        log(f"Temperature: {temperature}")
+        log(f"Max Tokens: {max_tokens}")
+        log(f"Retry Count: {retry_count}")
+
+        headers = {
+            "Content-Type": "application/json",
+        }
+
+        data = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+
+        logger.info(f"Calling Local LLM: {model} at {self.endpoint}")
+
+        # Retry Loop
+        for attempt in range(retry_count + 1):
+            try:
+                # 1. Make the Request
+                req = urllib.request.Request(
+                    self.endpoint,
+                    data=json.dumps(data).encode('utf-8'),
+                    headers=headers,
+                    method='POST'
+                )
+
+                with urllib.request.urlopen(req, timeout=120) as response:
+                    result = json.loads(response.read().decode('utf-8'))
+
+                # 2. Process Success
+                log(f"\n[LOCAL LLM RESPONSE]")
+                log(f"Structure keys: {list(result.keys())}")
+
+                # Check for API Error response first
+                if "error" in result:
+                    error_msg = result["error"].get("message", "Unknown API Error")
+                    log(f"API Error detected: {error_msg}")
+                    raise RuntimeError(f"Local LLM API returned error: {error_msg}")
+
+                if "choices" in result and len(result["choices"]) > 0:
+                    content = result["choices"][0]["message"].get("content", "")
+
+                    if not content or not content.strip():
+                        log("API returned empty content.")
+                        raise ValueError(f"Local LLM returned empty response for model '{model}'.")
+
+                    log(f"Content received: {len(content)} chars")
+                    return content
+                else:
+                    log(f"Unexpected response structure: {result}")
+                    raise ValueError(f"Unexpected API response structure: {result}")
+
+            except urllib.error.HTTPError as e:
+                # 3. Handle HTTP Errors
+                error_content = ""
+                try:
+                    error_body = e.read().decode('utf-8')
+                    log(f"HTTP Error Body: {error_body[:500]}")
+
+                    try:
+                        err_json = json.loads(error_body)
+                        if "error" in err_json:
+                            error_content = err_json["error"].get("message", "Unknown Error")
+                    except:
+                        if len(error_body) < 300:
+                            error_content = error_body
+                except:
+                    pass
+
+                # If it's a client error (4xx) but not 429, we fail immediately
+                if 400 <= e.code < 500 and e.code != 429:
+                    log(f"HTTP {e.code} - Client error (non-retryable)")
+                    if error_content:
+                        raise RuntimeError(f"Local LLM Error {e.code}: {error_content}")
+                    raise e
+
+                # If we've run out of retries
+                if attempt == retry_count:
+                    log(f"Final attempt failed: HTTP {e.code}")
+                    if error_content:
+                        raise RuntimeError(f"Local LLM Error {e.code}: {error_content}")
+                    raise e
+
+                # Calculate wait time for next retry
+                wait_time = 3 * (2 ** attempt)
+                log(f"Attempt {attempt + 1} failed: HTTP {e.code}. Retrying in {wait_time:.1f}s...")
+                time.sleep(wait_time)
+
+            except Exception as e:
+                # 4. Handle Network/Other Errors
+                if attempt == retry_count:
+                    log(f"Final attempt failed: {e}")
+                    raise e
+
+                wait_time = 3 * (2 ** attempt)
+                log(f"Attempt {attempt + 1} failed: {type(e).__name__}. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+
+        return "" # Should not be reached
+
+
+# ============================================================================
 # NODE: API CONFIG
 # ============================================================================
 
 class Z_ImageAPIConfig:
     """
-    Configuration node for OpenRouter API.
+    Configuration node for LLM API (OpenRouter or Local).
     """
-    
+
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "api_key": ("STRING", {
-                    "default": "",
-                    "placeholder": "sk-or-v1-xxxxx",
-                    "tooltip": "Get API key from https://openrouter.ai/keys"
+                "provider": (["openrouter", "local"], {
+                    "default": "openrouter",
+                    "tooltip": "Select API provider: OpenRouter (cloud) or Local LLM server"
                 }),
                 "model": ("STRING", {
                     "default": "qwen/qwen3-235b-a22b:free",
                     "multiline": False,
-                    "placeholder": "provider/model-name",
-                    "tooltip": "Enter the OpenRouter model ID"
+                    "placeholder": "Model name/ID",
+                    "tooltip": "OpenRouter: provider/model-name | Local: model name from your server"
+                }),
+                "api_key": ("STRING", {
+                    "default": "",
+                    "placeholder": "sk-or-v1-xxxxx (OpenRouter only)",
+                    "tooltip": "API key for OpenRouter (not needed for local LLM)"
+                }),
+                "local_endpoint": ("STRING", {
+                    "default": "http://localhost:11434/v1",
+                    "multiline": False,
+                    "placeholder": "http://localhost:11434/v1",
+                    "tooltip": "Local LLM endpoint (Ollama: 11434, LM Studio: 1234, vLLM: 8000, etc.)"
                 }),
             }
         }
-    
+
     RETURN_TYPES = ("API_CONFIG",)
     RETURN_NAMES = ("api_config",)
     FUNCTION = "configure"
     CATEGORY = "Z-Image"
-    
-    def configure(self, api_key: str, model: str):
-        """Create API configuration."""
-        
-        if not api_key.strip():
-            logger.warning("No API key provided in config!")
-        
+
+    def configure(self, provider: str, model: str, api_key: str, local_endpoint: str):
+        """Create API configuration based on provider selection."""
+
         clean_model = model.strip()
         if not clean_model:
             raise ValueError("Model ID cannot be empty!")
 
-        logger.info(f"Configured Model: {clean_model}")
-        
-        config = {
-            "api_key": api_key.strip(),
-            "model": clean_model,
-            "client": OpenRouterClient(api_key=api_key.strip()),
-        }
-        
+        if provider == "openrouter":
+            # OpenRouter Configuration
+            if not api_key.strip():
+                logger.warning("No API key provided for OpenRouter!")
+
+            logger.info(f"Configured OpenRouter Model: {clean_model}")
+
+            config = {
+                "provider": "openrouter",
+                "api_key": api_key.strip(),
+                "model": clean_model,
+                "client": OpenRouterClient(api_key=api_key.strip()),
+            }
+        else:
+            # Local LLM Configuration
+            clean_endpoint = local_endpoint.strip()
+            if not clean_endpoint:
+                raise ValueError("Local endpoint cannot be empty!")
+
+            logger.info(f"Configured Local LLM: {clean_model} at {clean_endpoint}")
+
+            config = {
+                "provider": "local",
+                "model": clean_model,
+                "endpoint": clean_endpoint,
+                "client": LocalLLMClient(endpoint=clean_endpoint),
+            }
+
         return (config,)
 
 
@@ -595,7 +766,7 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "Z_ImageAPIConfig": "Z-Image OpenRouter API Router",
+    "Z_ImageAPIConfig": "Z-Image LLM API Config (OpenRouter / Local)",
     "Z_ImagePromptEnhancer": "Z-Image Prompt Enhancer",
     "Z_ImagePromptEnhancerWithCLIP": "Z-Image Prompt Enhancer + CLIP",
 }

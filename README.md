@@ -49,7 +49,8 @@ living room interior with warm tones.
 
 ### Features
 
-- **Free to use** — Uses OpenRouter's free tier models (Qwen 235B by default)
+- **Flexible API options** — Use OpenRouter's free tier OR your own local LLM
+- **Local LLM support** — Works with Ollama, LM Studio, vLLM, text-generation-webui, and more
 - **Bilingual** — Automatically detects and handles Chinese and English prompts
 - **Reliable** — Smart retry logic with exponential backoff and rate limit handling
 - **Transparent** — Debug output shows full API request/response details
@@ -57,20 +58,73 @@ living room interior with warm tones.
 
 ### Setup
 
-Get a free API key from [OpenRouter](https://openrouter.ai/keys)
+**Option 1: OpenRouter (Cloud)**
+- Get a free API key from [OpenRouter](https://openrouter.ai/keys)
+
+**Option 2: Local LLM (Self-hosted)**
+- Install a local LLM server (examples below)
+- Make sure it exposes an OpenAI-compatible API endpoint
+
+#### Local LLM Options
+
+| Server | Default Port | Installation |
+|--------|--------------|--------------|
+| [Ollama](https://ollama.ai/) | 11434 | `curl -fsSL https://ollama.ai/install.sh \| sh` |
+| [LM Studio](https://lmstudio.ai/) | 1234 | Download from website |
+| [vLLM](https://github.com/vllm-project/vllm) | 8000 | `pip install vllm` |
+| [text-generation-webui](https://github.com/oobabooga/text-generation-webui) | 5000 | Follow repo instructions |
+
+**Example: Quick start with Ollama**
+```bash
+# Install Ollama
+curl -fsSL https://ollama.ai/install.sh | sh
+
+# Pull a model (e.g., Qwen 2.5)
+ollama pull qwen2.5:14b
+
+# The server starts automatically at http://localhost:11434
+```
 
 ### Nodes
 
-#### Z-Image OpenRouter API Router
+#### Z-Image LLM API Config (OpenRouter / Local)
 
 Configure your API connection once and reuse it across your workflow.
 
-| Parameter | Description |
-|-----------|-------------|
-| `api_key` | Your OpenRouter API key |
-| `model` | Model ID (default: `qwen/qwen3-235b-a22b:free`) |
+| Parameter | Description | Example |
+|-----------|-------------|---------|
+| `provider` | Select `openrouter` or `local` | `openrouter` |
+| `model` | Model name/ID | OpenRouter: `qwen/qwen3-235b-a22b:free`<br>Local: `qwen2.5:14b` |
+| `api_key` | Your OpenRouter API key (not needed for local) | `sk-or-v1-xxxxx` |
+| `local_endpoint` | Local LLM server endpoint (used when provider=local) | `http://localhost:11434/v1` |
 
 **Output:** `api_config`
+
+**Example Configurations:**
+
+*OpenRouter (Free):*
+```
+provider: openrouter
+model: qwen/qwen3-235b-a22b:free
+api_key: sk-or-v1-xxxxx
+local_endpoint: (ignored)
+```
+
+*Ollama (Local):*
+```
+provider: local
+model: qwen2.5:14b
+api_key: (not needed)
+local_endpoint: http://localhost:11434/v1
+```
+
+*LM Studio (Local):*
+```
+provider: local
+model: any-model-name
+api_key: (not needed)
+local_endpoint: http://localhost:1234/v1
+```
 
 ---
 
@@ -117,8 +171,10 @@ Same as above, but outputs CLIP conditioning directly.
 
 | Issue | Solution |
 |-------|----------|
-| Empty response errors | Increase `retry_count` or verify your API key |
+| Empty response errors | **OpenRouter:** Verify API key and increase `retry_count`<br>**Local:** Check that your LLM server is running and the endpoint is correct |
 | Rate limiting | The node respects `Retry-After` headers automatically; wait a few minutes if persistent |
+| Connection errors (local) | 1. Verify server is running (`ollama list` or check LM Studio)<br>2. Check endpoint URL matches server port<br>3. Ensure firewall allows local connections |
+| Model not found (local) | Make sure the model is downloaded (`ollama pull <model>` for Ollama) |
 | Unexpected output | Check `debug_log` for full API request/response details |
 
 ---
