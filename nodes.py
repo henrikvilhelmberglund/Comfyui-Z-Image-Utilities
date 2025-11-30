@@ -1470,9 +1470,6 @@ class Z_ImagePromptEnhancer:
                 "prompt_template": (["auto", "chinese", "english"], {
                     "default": "chinese",
                     "tooltip": TOOLTIPS["prompt_template"]
-                "output_language": (["auto", "english", "chinese"], {
-                    "default": "chinese",
-                    "tooltip": "auto: detect from input"
                 }),
             },
             "optional": {
@@ -1803,12 +1800,6 @@ class Z_ImagePromptEnhancerWithCLIP:
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID"
-                "api_config": ("API_CONFIG",),
-                "prompt": ("STRING", {"multiline": True, "default": ""}),
-                "output_language": (["auto", "english", "chinese"], {"default": "chinese"}),
-                "temperature": ("FLOAT", {"default": 0.7, "min": 0.1, "max": 1.5, "step": 0.05}),
-                "max_tokens": ("INT", {"default": 2048, "min": 256, "max": 8192, "step": 256}),
-                "retry_count": ("INT", {"default": 1, "min": 0, "max": 10, "step": 1}),
             }
         }
     
