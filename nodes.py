@@ -32,7 +32,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from io import BytesIO
 from pathlib import Path
@@ -61,7 +61,7 @@ except ImportError:
     HAS_COMFYUI = False
 
 if TYPE_CHECKING:
-    import torch
+    from torch import Tensor
 
 
 # ============================================================================
@@ -195,6 +195,14 @@ CHAT_SESSIONS: Dict[str, ChatSession] = {}
 
 def get_or_create_session(session_id: str, model: str = "") -> Tuple[ChatSession, bool]:
     """Get existing session or create a new one. Returns (session, is_new)."""
+    global _cleanup_counter
+    
+    # Run cleanup every 100 session accesses
+    _cleanup_counter += 1
+    if _cleanup_counter >= 100:
+        _cleanup_counter = 0
+        cleanup_old_sessions()
+    
     is_new = session_id not in CHAT_SESSIONS
     if is_new:
         CHAT_SESSIONS[session_id] = ChatSession(model=model)
@@ -211,6 +219,25 @@ def clear_session(session_id: str) -> bool:
     logger.debug(f"Session not found for clearing: {session_id}")
     return False
 
+# Session cleanup configuration
+MAX_SESSION_AGE_HOURS = 24
+_cleanup_counter = 0
+
+
+def cleanup_old_sessions() -> int:
+    """
+    Remove sessions older than MAX_SESSION_AGE_HOURS.
+    
+    Returns:
+        Number of sessions removed.
+    """
+    cutoff = datetime.now() - timedelta(hours=MAX_SESSION_AGE_HOURS)
+    expired = [sid for sid, sess in CHAT_SESSIONS.items() if sess.last_used < cutoff]
+    for sid in expired:
+        del CHAT_SESSIONS[sid]
+    if expired:
+        logger.info(f"Cleaned up {len(expired)} expired session(s)")
+    return len(expired)
 
 # ============================================================================
 # DEVICE AND MEMORY UTILITIES (Following QwenVL pattern)
@@ -270,7 +297,8 @@ def enforce_quantization(requested: Quantization, device_info: Dict[str, Any], m
     if device_info["recommended_device"] == "cuda":
         available = device_info["gpu"]["free_memory"]
     else:
-        available = device_info["system_memory"].get("available", 0) * 0.7  # Conservative estimate
+        sys_available = device_info["system_memory"].get("available", 0)
+        available = sys_available * 0.7 if sys_available > 0 else float('inf')  # Don't restrict if unknown
     
     # Check if we have enough memory with 20% buffer
     if model_vram_req * 1.2 > available:
@@ -413,7 +441,7 @@ class OpenRouterClient(BaseLLMClient):
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
-            "HTTP-Referer": "https://github.com/comfyui-zimage",
+            "HTTP-Referer": "https://github.com/Koko-boya/Comfyui-Z-Image-Utilities",
             "X-Title": "Z-Image Utility",
         }
         
@@ -423,6 +451,15 @@ class OpenRouterClient(BaseLLMClient):
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        
+        # Add optional parameters (top_p, top_k, seed, etc.)
+        # OpenRouter passes these through to the underlying model
+        # Map repeat_penalty to repetition_penalty (standard name)
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k != "repeat_penalty"}
+        data.update(filtered_kwargs)
+        
+        if "repeat_penalty" in kwargs:
+            data["repetition_penalty"] = kwargs["repeat_penalty"]
         
         for attempt in range(retry_count + 1):
             try:
@@ -488,7 +525,7 @@ class OpenRouterClient(BaseLLMClient):
                 self._log(f"Attempt {attempt + 1} failed: {type(e).__name__}: {str(e)}. Retrying in {wait_time}s...", "WARNING")
                 time.sleep(wait_time)
         
-        return ""
+        raise RuntimeError("Unexpected exit from retry loop")
     
     def _parse_http_error(self, e: urllib.error.HTTPError) -> str:
         """Parse HTTP error response for detailed error message."""
@@ -580,13 +617,17 @@ class LocalLLMClient(BaseLLMClient):
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
+            "keep_alive": "30m",  # Keep model loaded for 30 minutes
         }
         
         # Add optional parameters
-        if "seed" in kwargs:
-            data["seed"] = kwargs["seed"]
-        if "top_p" in kwargs:
-            data["top_p"] = kwargs["top_p"]
+        # Pass through all options (seed, top_k, etc.)
+        # Map repeat_penalty to repetition_penalty (standard name)
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k != "repeat_penalty"}
+        data.update(filtered_kwargs)
+        
+        if "repeat_penalty" in kwargs:
+            data["repetition_penalty"] = kwargs["repeat_penalty"]
         
         for attempt in range(retry_count + 1):
             try:
@@ -638,7 +679,7 @@ class LocalLLMClient(BaseLLMClient):
                 self._log(f"Attempt {attempt + 1} failed. Retrying in {wait_time}s...", "WARNING")
                 time.sleep(wait_time)
         
-        return ""
+        raise RuntimeError("Unexpected exit from retry loop")
 
 
 # ============================================================================
@@ -797,11 +838,24 @@ class DirectLocalModelClient(BaseLLMClient):
         """Generate response using loaded model."""
         self.clear_debug_log()
         
+        # Safety check for vision input
+        for msg in messages:
+            if isinstance(msg.get("content"), list):
+                raise ValueError("Direct model loading does not currently support image inputs/vision capabilities. Please disconnect the image or use OpenRouter/Local providers.")
+
         self._log(f"Direct Local Model - Repo: {self.repo_id}", "INFO")
         self._log(f"Quantization: {self.quantization.value}, Temperature: {temperature}")
         
         self.load_model(keep_loaded=keep_loaded)
         
+        # Handle Seed
+        if "seed" in kwargs:
+            seed = int(kwargs["seed"])
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+            self._log(f"Applied seed: {seed}")
+
         # Format messages using chat template
         text = self.tokenizer.apply_chat_template(
             messages,
@@ -816,16 +870,31 @@ class DirectLocalModelClient(BaseLLMClient):
         device = next(self.model.parameters()).device
         inputs = {k: v.to(device) for k, v in inputs.items()}
         
+        # Prepare generation arguments
+        gen_kwargs = {
+            "max_new_tokens": max_tokens,
+            "temperature": temperature if temperature > 0 else None,
+            "do_sample": temperature > 0,
+            "pad_token_id": self.tokenizer.eos_token_id,
+        }
+        
+        # Map and add optional parameters
+        if "top_p" in kwargs:
+            gen_kwargs["top_p"] = float(kwargs["top_p"])
+        if "top_k" in kwargs:
+            gen_kwargs["top_k"] = int(kwargs["top_k"])
+        if "repeat_penalty" in kwargs:
+            gen_kwargs["repetition_penalty"] = float(kwargs["repeat_penalty"])
+            
+        self._log(f"Generation params: {gen_kwargs}")
+
         # Generate
         self._log("Generating response...", "INFO")
         
         with torch.no_grad():
             outputs = self.model.generate(
                 **inputs,
-                max_new_tokens=max_tokens,
-                temperature=temperature if temperature > 0 else None,
-                do_sample=temperature > 0,
-                pad_token_id=self.tokenizer.eos_token_id,
+                **gen_kwargs
             )
         
         # Decode
@@ -906,7 +975,7 @@ def clean_llm_output(text: str, max_length: int = 0, debug_log: Optional[List[st
     
     # IMPORTANT: Remove trailing quoted keyword lists
     # Pattern 1: "keyword" descriptor, "keyword" descriptor format
-    keyword_list_pattern = r',\s*"[^"]{1,80}"\s+\w+(?:,\s*"[^"]{1,80}"\s+\w+){2,}'
+    keyword_list_pattern = r',\s*"[^"]{1,80}"\s+\w+(?:,\s*"[^"]{1,80}"\s+\w+){2,}\s*$'
     match = re.search(keyword_list_pattern, text)
     if match:
         if debug_log:
@@ -1253,7 +1322,7 @@ class Z_ImagePromptEnhancer:
         options: Optional[Dict[str, Any]] = None,
         image: Optional["torch.Tensor"] = None,
         retry_count: int = 3,
-        max_output_length: int = 0,
+        max_output_length: int = 6000,
         session_id: str = "",
         reset_session: bool = False,
         keep_model_loaded: bool = True,
@@ -1405,7 +1474,8 @@ class Z_ImagePromptEnhancer:
         
         # Add client log to debug output
         debug_lines.append(f"\n[CLIENT LOG]")
-        debug_lines.extend(client.debug_log)
+        if hasattr(client, 'debug_log'):
+            debug_lines.extend(client.debug_log)
         
         # Handle empty response
         if not response or not response.strip():
@@ -1431,9 +1501,16 @@ class Z_ImagePromptEnhancer:
         debug_lines.append(f"Final length: {len(enhanced)} characters")
         debug_lines.append(f"Full enhanced prompt:\n{enhanced}")
         
-        # Token estimation (0.75 words per token, ~5 chars per word)
-        estimated_words = len(enhanced) / 5
-        estimated_tokens = estimated_words / 0.75
+        # Token estimation - language-aware
+        if lang == "zh":
+            # Chinese: roughly 1.5-2 characters per token
+            estimated_tokens = len(enhanced) / 1.5
+            estimated_words = len(enhanced)  # Each character roughly a "word"
+        else:
+            # English: ~4 chars per token on average
+            estimated_tokens = len(enhanced) / 4
+            estimated_words = len(enhanced) / 5
+            
         debug_lines.append(f"\n[TOKEN ESTIMATE]")
         debug_lines.append(f"Estimated words: ~{int(estimated_words)}")
         debug_lines.append(f"Estimated tokens: ~{int(estimated_tokens)} (Z-Image-Turbo limit: 512 default, 1024 max)")
@@ -1469,16 +1546,51 @@ class Z_ImagePromptEnhancerWithCLIP:
             "required": {
                 "clip": ("CLIP",),
                 "config": ("ZIMAGE_CONFIG",),
-                "prompt": ("STRING", {"multiline": True, "default": ""}),
-                "prompt_template": (["auto", "english", "chinese"], {"default": "auto"}),
+                "prompt": ("STRING", {
+                    "multiline": True,
+                    "default": "",
+                    "placeholder": "Enter your prompt to enhance..."
+                }),
+                "prompt_template": (["auto", "chinese", "english"], {
+                    "default": "chinese",
+                    "tooltip": TOOLTIPS["prompt_template"]
+                }),
             },
             "optional": {
                 "options": ("ZIMAGE_OPTIONS",),
-                "image": ("IMAGE",),
-                "retry_count": ("INT", {"default": 3, "min": 0, "max": 10, "step": 1}),
-                "max_output_length": ("INT", {"default": 0, "min": 0, "max": 10000, "step": 100}),
-                "keep_model_loaded": ("BOOLEAN", {"default": True}),
-                "utf8_sanitize": ("BOOLEAN", {"default": False}),
+                "image": ("IMAGE", {
+                    "tooltip": TOOLTIPS["image"]
+                }),
+                "retry_count": ("INT", {
+                    "default": 3,
+                    "min": 0,
+                    "max": 10,
+                    "step": 1,
+                    "tooltip": TOOLTIPS["retry_count"]
+                }),
+                "max_output_length": ("INT", {
+                    "default": 6000,
+                    "min": 0,
+                    "max": 10000,
+                    "step": 100,
+                    "tooltip": TOOLTIPS["max_output_length"]
+                }),
+                "session_id": ("STRING", {
+                    "default": "",
+                    "tooltip": TOOLTIPS["session_id"]
+                }),
+                "reset_session": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": TOOLTIPS["reset_session"]
+                }),
+                "keep_model_loaded": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": TOOLTIPS["keep_model_loaded"]
+                }),
+                "utf8_sanitize": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": TOOLTIPS["utf8_sanitize"]
+                }),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID"
@@ -1501,7 +1613,9 @@ class Z_ImagePromptEnhancerWithCLIP:
         options: Optional[Dict[str, Any]] = None,
         image: Optional["torch.Tensor"] = None,
         retry_count: int = 3,
-        max_output_length: int = 0,
+        max_output_length: int = 6000,
+        session_id: str = "",
+        reset_session: bool = False,
         keep_model_loaded: bool = True,
         utf8_sanitize: bool = False,
     ):
@@ -1517,6 +1631,8 @@ class Z_ImagePromptEnhancerWithCLIP:
             image=image,
             retry_count=retry_count,
             max_output_length=max_output_length,
+            session_id=session_id,
+            reset_session=reset_session,
             keep_model_loaded=keep_model_loaded,
             utf8_sanitize=utf8_sanitize,
         )
